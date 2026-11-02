@@ -22,9 +22,10 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, Dataset
 
-from fairseq_signals.utils.store import MemmapBatchWriter, MemmapReader, memmap_batch_process
 
 def load_from_encoder_out(directory, split, device):
+    from fairseq_signals.utils.store import MemmapReader, memmap_batch_process
+
     def encoder_out_to_emb(x, device='cpu'):
         x = torch.from_numpy(np.array(x)).to(device)
 
@@ -191,6 +192,7 @@ class Trainer:
         optimizer,
         device,
         checkpoint_path,
+        last_checkpoint_path=None,
         n_epochs=10,
         save_every_n=1,
         from_checkpoint=None,
@@ -203,6 +205,10 @@ class Trainer:
         self.device = device
         self.n_epochs = n_epochs
         self.checkpoint_path = checkpoint_path
+        self.last_checkpoint_path = last_checkpoint_path or os.path.join(
+            os.path.dirname(checkpoint_path),
+            'last_ckp.pt',
+        )
         self.save_every_n = save_every_n
         self.criterion = nn.BCEWithLogitsLoss()
         self.train_losses = []
@@ -211,12 +217,13 @@ class Trainer:
         self.valid_auprcs = []
         self.best_auprc = 0.0
         self.prev_epoch = 0
+        self._checkpoint_saved = False
 
         if from_checkpoint:
             self.load_checkpoint(from_checkpoint)
 
     def load_checkpoint(self, path):
-        checkpoint = torch.load(path)
+        checkpoint = torch.load(path, weights_only=False)
         self.model.load_state_dict(checkpoint['state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.train_losses = checkpoint['train_losses']
@@ -227,7 +234,7 @@ class Trainer:
         self.prev_epoch = checkpoint['epoch']
         print(f"Loaded checkpoint '{path}' (epoch {self.prev_epoch})")
 
-    def save_checkpoint(self, epoch, is_best=False):
+    def save_checkpoint(self, epoch, is_best=False, is_last=False):
         checkpoint = {
             'epoch': self.prev_epoch + epoch + 1,
             'state_dict': self.model.state_dict(),
@@ -239,8 +246,14 @@ class Trainer:
             'valid_auprcs': self.valid_auprcs,
         }
         if is_best:
+            os.makedirs(os.path.dirname(self.checkpoint_path) or '.', exist_ok=True)
             torch.save(checkpoint, self.checkpoint_path)
+            self._checkpoint_saved = True
             print(f"New best checkpoint saved with AUPRC: {self.best_auprc:.4f}")
+        if is_last:
+            os.makedirs(os.path.dirname(self.last_checkpoint_path) or '.', exist_ok=True)
+            torch.save(checkpoint, self.last_checkpoint_path)
+            print(f"Last checkpoint saved after epoch {checkpoint['epoch']}")
 
     def train(self):
         for epoch in range(self.n_epochs):
@@ -272,6 +285,8 @@ class Trainer:
                     self.best_auprc = valid_auprc
                     self.save_checkpoint(epoch, is_best=True)
 
+            self.save_checkpoint(epoch, is_last=True)
+
             print(
                 f'Epoch {self.prev_epoch + epoch + 1} - '
                 f'Train Loss: {avg_train_loss:.4f}, '
@@ -279,6 +294,10 @@ class Trainer:
                 f'Val AUROC: {valid_auroc:.4f}, '
                 f'Val AUPRC: {valid_auprc:.4f}'
             )
+
+        if not self._checkpoint_saved:
+            self.best_auprc = max(self.valid_auprcs)
+            self.save_checkpoint(self.n_epochs - 1, is_best=True)
 
     def _evaluate(self, split='valid'):
         self.model.eval()
@@ -312,6 +331,8 @@ class Trainer:
         return {'loss': avg_valid_loss, 'auroc': valid_auroc, 'auprc': valid_auprc}
 
     def save_outputs(self, save_dir, split='valid'):
+        from fairseq_signals.utils.store import MemmapBatchWriter
+
         logits, targets, _ = self._evaluate(split=split)
         logits, targets = logits.numpy(), targets.numpy()
 
@@ -374,7 +395,8 @@ def main(args):
         loaders,
         optimizer,
         args.device,
-        os.path.join(args.directory, 'linear.pt'),
+        os.path.join(args.directory, 'long_ckp', 'best_ckp.pt'),
+        last_checkpoint_path=os.path.join(args.directory, 'long_ckp', 'last_ckp.pt'),
         n_epochs=args.n_epochs,
         save_every_n=10,
     )
@@ -382,7 +404,7 @@ def main(args):
     plot(trainer)
 
     # Load best checkpoint
-    trainer.load_checkpoint(os.path.join(args.directory, 'linear.pt'))
+    trainer.load_checkpoint(os.path.join(args.directory, 'long_ckp', 'best_ckp.pt'))
 
     print('\nFinal validation metrics')
     print(trainer.evaluate(split='valid'))
@@ -393,7 +415,7 @@ def main(args):
     checkpoint_metrics = pd.DataFrame({
         'train_loss': trainer.train_losses,
         'valid_loss': trainer.valid_losses,
-        'valid_auroc': trainer.valid_losses,
+        'valid_auroc': trainer.valid_aurocs,
         'valid_auprc':  trainer.valid_auprcs,
     })
     checkpoint_metrics.index.name = 'checkpoint'
